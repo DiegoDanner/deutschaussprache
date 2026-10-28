@@ -876,12 +876,34 @@
      */
     let zungenRecognizer = null;
     let isZungenRecording = false;
+    let zungenTranscript = '';
+    let zungenRecognitionError = '';
     let visualizerAnimId = null;
     let audioStream = null;
     let analyserNode = null;
     let analyserDataArray = null;
 
-    const TARGET_WORDS = ['küche', 'kuchen', 'kirche', 'kirschen'];
+    const ZUNGEN_TARGET_ALIASES = {
+      kuche: ['kuche'],
+      kuchen: ['kuchen'],
+      kirche: ['kirche', 'kirchen'],
+      kirschen: ['kirschen', 'kirsche']
+    };
+
+    function normalizeZungenWord(word) {
+      return word.toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/ß/g, 'ss')
+        .replace(/[^a-z]/g, '');
+    }
+
+    function countZungenTargets(spoken) {
+      const words = new Set((spoken.toLowerCase().match(/[a-zäöüß]+/g) || [])
+        .map(normalizeZungenWord));
+      return Object.values(ZUNGEN_TARGET_ALIASES)
+        .filter(aliases => aliases.some(alias => words.has(alias))).length;
+    }
 
     function initCanvasVisualizer() {
       const canvas = document.getElementById('visualizerCanvas');
@@ -949,25 +971,6 @@
         return;
       }
 
-      // Hook microphone to Web Audio analyser
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        audioStream = stream;
-        const ctx = getAudioCtx();
-        const source = ctx.createMediaStreamSource(stream);
-        analyserNode = ctx.createAnalyser();
-        analyserNode.fftSize = 64;
-        analyserDataArray = new Uint8Array(analyserNode.frequencyBinCount);
-        source.connect(analyserNode);
-      } catch (err) {
-        console.warn('Microphone stream for canvas visualizer was blocked:', err);
-      }
-
-      zungenRecognizer = new SpeechRecognition();
-      zungenRecognizer.lang = 'de-DE';
-      zungenRecognizer.continuous = true;
-      zungenRecognizer.interimResults = true;
-
       const recordBtn = document.getElementById('recordZungenBtn');
       const recordIcon = document.getElementById('recordZungenIcon');
       const recordLabel = document.getElementById('recordZungenLabel');
@@ -975,16 +978,27 @@
       const micStatus = document.getElementById('micStatusText');
       const transcriptBox = document.getElementById('realtimeTranscript');
 
+      zungenTranscript = '';
+      zungenRecognitionError = '';
+      document.getElementById('zungenResultBanner').classList.add('hidden');
+      document.getElementById('targetsMatched').innerText = '0 / 4';
+      document.getElementById('targetPct').innerText = '0%';
       isZungenRecording = true;
       recordBtn.className = 'w-full sm:w-auto px-7 py-3 bg-slate-900 border-2 border-rose-500 text-white font-extrabold text-sm rounded-2xl shadow-xl flex items-center justify-center gap-2.5';
       recordIcon.className = 'fa-solid fa-stop text-rose-500 fa-beat';
       recordLabel.innerText = 'Parar e Avaliar';
+      recordBtn.disabled = false;
 
       micDot.className = 'w-3 h-3 rounded-full bg-rose-500 pulse-mic';
       micStatus.innerText = 'Gravando... Fale o trava-línguas!';
       transcriptBox.innerHTML = '<span class="text-amber-400 animate-pulse">Escutando em tempo real...</span>';
 
       showReactionEmoji('👂');
+
+      zungenRecognizer = new SpeechRecognition();
+      zungenRecognizer.lang = 'de-DE';
+      zungenRecognizer.continuous = true;
+      zungenRecognizer.interimResults = true;
 
       let accumulated = '';
       zungenRecognizer.onresult = (event) => {
@@ -997,40 +1011,105 @@
           }
         }
         const fullSpoken = (accumulated + ' ' + interim).trim().toLowerCase();
+        zungenTranscript = fullSpoken;
         parseZungenTranscript(fullSpoken);
       };
 
       zungenRecognizer.onerror = (e) => {
         console.warn('Zungen Recognition Error:', e);
+        const messages = {
+          'not-allowed': 'Permita o acesso ao microfone nas configurações do navegador e tente novamente.',
+          'service-not-allowed': 'O serviço de reconhecimento de fala está bloqueado neste navegador.',
+          'no-speech': 'Nenhuma fala foi detectada. Tente novamente e fale logo após iniciar.',
+          'audio-capture': 'Nenhum microfone disponível. Verifique a conexão e as permissões do dispositivo.',
+          network: 'Não foi possível conectar ao serviço de reconhecimento. Verifique sua internet e tente novamente.'
+        };
+        if (e.error !== 'aborted') {
+          zungenRecognitionError = messages[e.error] || 'O reconhecimento de fala falhou. Tente novamente.';
+          micStatus.innerText = zungenRecognitionError;
+          if (!zungenTranscript) transcriptBox.textContent = zungenRecognitionError;
+        }
+      };
+
+      zungenRecognizer.onend = () => {
+        isZungenRecording = false;
+        if (audioStream) {
+          audioStream.getTracks().forEach(track => track.stop());
+          audioStream = null;
+        }
+        analyserNode = null;
+        analyserDataArray = null;
+        recordBtn.disabled = false;
+        recordBtn.className = 'w-full sm:w-auto px-7 py-3 bg-gradient-to-r from-rose-500 to-red-600 hover:from-rose-600 hover:to-red-700 text-white font-extrabold text-sm rounded-2xl shadow-xl shadow-rose-600/25 flex items-center justify-center gap-2.5 transition';
+        recordIcon.className = 'fa-solid fa-microphone text-base';
+        recordLabel.innerText = 'Gravar Trava-Língua';
+        micDot.className = 'w-3 h-3 rounded-full bg-slate-600';
+
+        if (zungenTranscript) {
+          micStatus.innerText = 'Gravação encerrada';
+          evaluateZungenScore();
+        } else {
+          document.getElementById('targetsMatched').innerText = '0 / 4';
+          document.getElementById('targetPct').innerText = '0%';
+          micStatus.innerText = zungenRecognitionError || 'Nenhuma fala foi reconhecida. Tente gravar novamente.';
+          transcriptBox.textContent = zungenRecognitionError || 'Não foi possível reconhecer sua fala. Verifique o microfone e tente novamente.';
+          evaluateZungenScore();
+        }
       };
 
       try {
         zungenRecognizer.start();
       } catch (err) {
         console.error(err);
+        isZungenRecording = false;
+        zungenRecognitionError = 'Não foi possível iniciar o microfone. Verifique as permissões do navegador e tente novamente.';
+        micStatus.innerText = zungenRecognitionError;
+        transcriptBox.textContent = zungenRecognitionError;
+        recordBtn.className = 'w-full sm:w-auto px-7 py-3 bg-gradient-to-r from-rose-500 to-red-600 hover:from-rose-600 hover:to-red-700 text-white font-extrabold text-sm rounded-2xl shadow-xl shadow-rose-600/25 flex items-center justify-center gap-2.5 transition';
+        recordIcon.className = 'fa-solid fa-microphone text-base';
+        recordLabel.innerText = 'Gravar Trava-Língua';
+        return;
       }
+
+      // The browser speech service owns recognition; this separate stream is only for the visualizer.
+      navigator.mediaDevices?.getUserMedia({ audio: true }).then(stream => {
+        if (!isZungenRecording) {
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+        audioStream = stream;
+        const ctx = getAudioCtx();
+        const source = ctx.createMediaStreamSource(stream);
+        analyserNode = ctx.createAnalyser();
+        analyserNode.fftSize = 64;
+        analyserDataArray = new Uint8Array(analyserNode.frequencyBinCount);
+        source.connect(analyserNode);
+      }).catch(err => {
+        console.warn('Microphone stream for canvas visualizer was blocked:', err);
+      });
     }
 
     function parseZungenTranscript(spoken) {
       const transcriptBox = document.getElementById('realtimeTranscript');
 
-      let matches = 0;
-      TARGET_WORDS.forEach(tw => {
-        if (spoken.includes(tw) || (tw === 'kirschen' && spoken.includes('kirsche'))) {
-          matches++;
+      const matches = countZungenTargets(spoken);
+
+      transcriptBox.replaceChildren();
+      const words = spoken.split(/(\s+)/);
+      words.forEach(word => {
+        const clean = normalizeZungenWord(word);
+        const isTarget = Object.values(ZUNGEN_TARGET_ALIASES)
+          .some(aliases => aliases.includes(clean));
+        if (isTarget) {
+          const highlight = document.createElement('span');
+          highlight.className = 'text-emerald-400 font-extrabold underline';
+          highlight.textContent = word;
+          transcriptBox.appendChild(highlight);
+        } else {
+          transcriptBox.appendChild(document.createTextNode(word));
         }
       });
-
-      // Highlight keywords
-      const formatted = spoken.split(' ').map(w => {
-        const clean = w.replace(/[^a-zA-ZäöüÄÖÜß]/g, '');
-        if (['küche', 'kuchen', 'kirche', 'kirschen', 'kirsche'].includes(clean)) {
-          return `<span class="text-emerald-400 font-extrabold underline">${w}</span>`;
-        }
-        return w;
-      }).join(' ');
-
-      transcriptBox.innerHTML = formatted || '...';
+      if (!spoken) transcriptBox.textContent = '...';
       document.getElementById('targetsMatched').innerText = `${matches} / 4`;
       const pct = Math.round((matches / 4) * 100);
       document.getElementById('targetPct').innerText = `${pct}%`;
@@ -1044,11 +1123,15 @@
 
     function stopZungenRecording() {
       isZungenRecording = false;
+      document.getElementById('micStatusText').innerText = 'Finalizando a transcrição...';
+      document.getElementById('recordZungenBtn').disabled = true;
       if (zungenRecognizer) {
-        try { zungenRecognizer.stop(); } catch (e) {}
-      }
-      if (audioStream) {
-        audioStream.getTracks().forEach(t => t.stop());
+        try {
+          zungenRecognizer.stop();
+          return;
+        } catch (e) {
+          console.warn('Could not stop speech recognition cleanly:', e);
+        }
       }
 
       const recordBtn = document.getElementById('recordZungenBtn');
@@ -1057,27 +1140,40 @@
       const micDot = document.getElementById('micDot');
       const micStatus = document.getElementById('micStatusText');
 
+      if (audioStream) {
+        audioStream.getTracks().forEach(track => track.stop());
+        audioStream = null;
+      }
+      recordBtn.disabled = false;
       recordBtn.className = 'w-full sm:w-auto px-7 py-3 bg-gradient-to-r from-rose-500 to-red-600 hover:from-rose-600 hover:to-red-700 text-white font-extrabold text-sm rounded-2xl shadow-xl shadow-rose-600/25 flex items-center justify-center gap-2.5 transition';
       recordIcon.className = 'fa-solid fa-microphone text-base';
       recordLabel.innerText = 'Gravar Trava-Língua';
 
       micDot.className = 'w-3 h-3 rounded-full bg-slate-600';
-      micStatus.innerText = 'Gravação encerrada';
+      micStatus.innerText = zungenTranscript ? 'Gravação encerrada' : 'Nenhuma fala foi reconhecida. Tente novamente.';
 
       evaluateZungenScore();
     }
 
     function evaluateZungenScore() {
-      const text = document.getElementById('realtimeTranscript').innerText.toLowerCase();
-      let matches = 0;
-      TARGET_WORDS.forEach(tw => {
-        if (text.includes(tw) || (tw === 'kirschen' && text.includes('kirsche'))) {
-          matches++;
-        }
-      });
+      const matches = countZungenTargets(zungenTranscript);
 
       const banner = document.getElementById('zungenResultBanner');
       banner.classList.remove('hidden');
+
+      if (!zungenTranscript.trim()) {
+        banner.className = 'p-4 rounded-2xl bg-slate-900 border border-slate-700 text-slate-300 block';
+        banner.innerHTML = `
+          <div class="flex items-center gap-3">
+            <span class="text-3xl">🎙️</span>
+            <div>
+              <strong class="text-white block text-sm">Não foi possível reconhecer sua fala.</strong>
+              <span>${zungenRecognitionError || 'Verifique o microfone e tente novamente, falando logo após iniciar a gravação.'}</span>
+            </div>
+          </div>
+        `;
+        return;
+      }
 
       if (matches >= 4) {
         playSuccessChime();
@@ -1133,6 +1229,8 @@
 
     function resetZungenbrecher() {
       if (isZungenRecording) stopZungenRecording();
+      zungenTranscript = '';
+      zungenRecognitionError = '';
       document.getElementById('realtimeTranscript').innerHTML = 'Clique no botão abaixo para começar a gravar...';
       document.getElementById('targetsMatched').innerText = '0 / 4';
       document.getElementById('targetPct').innerText = '0%';
